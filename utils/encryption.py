@@ -14,7 +14,7 @@ def encrypt(pt, password):
     """Encryption function to securely store user credentials, uses ChaCha_Poly1305
     with a user defined SCrypt key."""
     salt = get_random_bytes(16)
-    key = scrypt(password, salt, key_len=16, N=4, r=8, p=1)
+    key = scrypt(password, salt, key_len=32, N=4, r=8, p=1)
     nonce = get_random_bytes(12)
     cipher = ChaCha20_Poly1305.new(key=key, nonce=nonce)
     ct, tag = cipher.encrypt_and_digest(pt)
@@ -32,7 +32,7 @@ def decrypt(ct, password):
         json_k = ["nonce", "salt", "ct", "tag"]
         json_v = {k: b64decode(b64Ct[k]) for k in json_k}
 
-        key = scrypt(password, json_v["salt"], key_len=16, N=4, r=8, p=1)
+        key = scrypt(password, json_v["salt"], key_len=32, N=4, r=8, p=1)
         cipher = ChaCha20_Poly1305.new(key=key, nonce=json_v["nonce"])
         ptData = cipher.decrypt_and_verify(json_v["ct"], json_v["tag"])
 
