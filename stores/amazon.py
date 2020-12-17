@@ -1,10 +1,12 @@
 import json
 import math
 import os
+import platform
 import random
 import time
 from datetime import datetime
 
+import psutil
 import stdiomask
 from amazoncaptcha import AmazonCaptcha
 from chromedriver_py import binary_path  # this will get you the path variable
@@ -15,16 +17,16 @@ from selenium.common import exceptions
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 
+from utils import discord_presence as presence
 from utils.debugger import debug
-from utils.discord_presence import searching_update, buy_update, start_presence
 from utils.encryption import create_encrypted_config, load_encrypted_config
 from utils.logger import log
 from utils.selenium_utils import options, enable_headless
-from utils.version import version
 
 AMAZON_URLS = {
     "BASE_URL": "https://{domain}/",
     "OFFER_URL": "https://{domain}/gp/offer-listing/",
+    "CART_URL": "https://{domain}/gp/cart/view.html",
 }
 CHECKOUT_URL = "https://{domain}/gp/cart/desktop/go-to-checkout.html/ref=ox_sc_proceed?partialCheckoutCart=1&isToBeGiftWrappedBefore=0&proceedToRetailCheckout=Proceed+to+checkout&proceedToCheckout=1&cartInitiateId={cart_id}"
 
@@ -123,6 +125,10 @@ ADD_TO_CART_TITLES = [
     "AmazonSmile: Please Confirm Your Action",
     "",  # Amazon.nl has en empty title, sigh.
 ]
+BUSINESS_PO_TITLES = [
+    "Business order information",
+]
+
 DOGGO_TITLES = ["Sorry! Something went wrong!"]
 
 # this is not non-US friendly
@@ -160,6 +166,7 @@ DEFAULT_MAX_WEIRD_PAGE_DELAY = 5
 DEFAULT_PAGE_WAIT_DELAY = 0.5  # also serves as minimum wait for randomized delays
 DEFAULT_MAX_PAGE_WAIT_DELAY = 1.0  # used for random page wait delay
 MAX_CHECKOUT_BUTTON_WAIT = 3  # integers only
+DEFAULT_REFRESH_DELAY = 3
 
 
 class Amazon:
@@ -185,13 +192,16 @@ class Amazon:
         self.detailed = detailed
         self.used = used
         self.single_shot = single_shot
-        self.disable_presence = disable_presence
         self.take_screenshots = not no_screenshots
         self.start_time = time.time()
         self.start_time_atc = 0
+        self.webdriver_child_pids = []
+        self.driver = None
+        self.refresh_delay = DEFAULT_REFRESH_DELAY
+        self.testing = False
 
-        if not self.disable_presence:
-            start_presence("Spinning up")
+        presence.enabled = not disable_presence
+        presence.start_presence()
 
         # Create necessary sub-directories if they don't exist
         if not os.path.exists("screenshots"):
@@ -212,6 +222,7 @@ class Amazon:
             self.password = credential["password"]
         else:
             log.info("No credential file found, let's make one")
+            log.info("NOTE: DO NOT SAVE YOUR CREDENTIALS IN CHROME, CLICK NEVER!")
             credential = self.await_credential_input()
             create_encrypted_config(credential, CREDENTIAL_FILE)
             self.username = credential["username"]
@@ -254,9 +265,12 @@ class Amazon:
         try:
             self.driver = webdriver.Chrome(executable_path=binary_path, options=options)
             self.wait = WebDriverWait(self.driver, 10)
+            self.get_webdriver_pids()
         except Exception as e:
-            log.info("you probably have chrome open, you should close it")
             log.error(e)
+            log.warning(
+                "You probably have a previous Chrome window open. You should close it"
+            )
             exit(1)
 
         for key in AMAZON_URLS.keys():
@@ -271,7 +285,11 @@ class Amazon:
             "password": password,
         }
 
-    def run(self, delay=3, test=False):
+    def run(self, delay=DEFAULT_REFRESH_DELAY, test=False):
+        self.testing = test
+        self.refresh_delay = delay
+        self.show_config()
+
         log.info("Waiting for home page.")
         while True:
             try:
@@ -288,6 +306,7 @@ class Amazon:
         self.handle_startup()
         if not self.is_logged_in():
             self.login()
+        self.notification_handler.play_notify_sound()
         self.send_notification(
             "Bot Logged in and Starting up", "Start-Up", self.take_screenshots
         )
@@ -371,12 +390,12 @@ class Amazon:
             self.driver.find_element_by_xpath('//*[@id="ap_email"]').send_keys(
                 self.username + Keys.RETURN
             )
-        except exceptions.NoSuchElementException:
+        except exceptions.NoSuchElementException or exceptions.ElementNotInteractableException:
             log.info("Email not needed.")
             pass
 
         if self.driver.find_elements_by_xpath('//*[@id="auth-error-message-box"]'):
-            log.error("Login failed, check your username in amazon_config.json")
+            log.error("Login failed, delete your credentials file")
             time.sleep(240)
             exit(1)
 
@@ -431,11 +450,7 @@ class Amazon:
                     + "/ref=olp_f_new&f_new=true&f_freeShipping=on"
                 )
 
-        if not self.disable_presence:
-            try:
-                searching_update()
-            except:
-                pass
+        presence.searching_update()
 
         try:
             while True:
@@ -443,7 +458,7 @@ class Amazon:
                     self.driver.get(f.url)
                     break
                 except Exception:
-                    log.error("Failed to get the URL, were in the exception now.")
+                    log.error("Failed to load the offer URL.  Retrying...")
                     time.sleep(3)
                     pass
             elements = self.driver.find_elements_by_xpath(
@@ -482,12 +497,9 @@ class Amazon:
             ):
                 log.info("Item in stock and in reserve range!")
                 log.info("clicking add to cart")
+                self.notification_handler.play_notify_sound()
 
-                if not self.disable_presence:
-                    try:
-                        buy_update()
-                    except:
-                        pass
+                presence.buy_update()
 
                 elements[i].click()
                 time.sleep(self.page_wait_delay())
@@ -544,6 +556,8 @@ class Amazon:
             self.handle_doggos()
         elif title in OUT_OF_STOCK:
             self.handle_out_of_stock()
+        elif title in BUSINESS_PO_TITLES:
+            self.handle_business_po()
         else:
             log.error(
                 f"{title} is not a known title, please create issue indicating the title with a screenshot of page"
@@ -552,6 +566,25 @@ class Amazon:
                 "Encountered Unknown Page Title", "unknown-title", self.take_screenshots
             )
             self.save_page_source("unknown-title")
+            log.info("going to try and redirect to cart page")
+            try:
+                self.driver.get(AMAZON_URLS["CART_URL"])
+            except:
+                log.error(
+                    "failed to load cart URL, refreshing and returning to handler"
+                )
+                self.driver.refresh()
+                return
+            log.info("trying to block proceed to checkout")
+            try:
+                self.driver.find_element_by_xpath(
+                    '//*[@id="sc-buy-box-ptc-button"]'
+                ).click()
+            except exceptions.NoSuchElementException:
+                log.error(
+                    "could not find and click button, refreshing and returning to handler"
+                )
+                self.driver.refresh()
 
     @debug
     def handle_prime_signup(self):
@@ -582,6 +615,7 @@ class Amazon:
             button.click()
         else:
             log.error("Prime offer page popped up, user intervention required")
+            self.notification_handler.play_alarm_sound()
             self.notification_handler.send_notification(
                 "Prime offer page popped up, user intervention required"
             )
@@ -744,6 +778,24 @@ class Amazon:
             log.error("refreshing")
             self.driver.refresh()
 
+    @debug
+    def handle_business_po(self):
+        log.info("On Business PO Page, Trying to move on to checkout")
+        button = None
+        try:
+            button = self.driver.find_element_by_xpath(
+                '//*[@id="a-autoid-0"]/span/input'
+            )
+        except exceptions.NoSuchElementException:
+            log.info("Could not find the continue button")
+        if button:
+            button.click()
+        else:
+            self.notification_handler.send_notification(
+                "Could not click continue button, user intervention required"
+            )
+            time.sleep(DEFAULT_MAX_WEIRD_PAGE_DELAY)
+
     def save_screenshot(self, page):
         file_name = get_timestamp_filename("screenshots/screenshot-" + page, ".png")
         try:
@@ -777,6 +829,62 @@ class Amazon:
             self.notification_handler.send_notification(message, file_name)
         else:
             self.notification_handler.send_notification(message)
+
+    def get_webdriver_pids(self):
+        pid = self.driver.service.process.pid
+        driver_process = psutil.Process(pid)
+        children = driver_process.children(recursive=True)
+        for child in children:
+            self.webdriver_child_pids.append(child.pid)
+
+    def __del__(self):
+        try:
+            if platform.system() == "Windows" and self.driver:
+                log.info("Cleaning up after web driver...")
+                # brute force kill child Chrome pids with fire
+                for pid in self.webdriver_child_pids:
+                    try:
+                        log.debug(f"Killing {pid}...")
+                        process = psutil.Process(pid)
+                        process.kill()
+                    except psutil.NoSuchProcess:
+                        log.debug(f"{pid} not found. Continuing...")
+                        pass
+            elif self.driver:
+                self.driver.quit()
+
+        except Exception as e:
+            log.info(e)
+            log.info(
+                "Failed to clean up after web driver.  Please manually close browser."
+            )
+
+    def show_config(self):
+        log.info(f"{'=' * 50}")
+        log.info(f"Starting Amazon ASIN Hunt for {len(self.asin_list)} Products with:")
+        log.info(f"--Delay of {self.refresh_delay} seconds")
+        if self.used:
+            log.info(f"--Used items are considered for purchase")
+        if self.checkshipping:
+            log.info(f"--Shipping costs are included in price calculations")
+        else:
+            log.info(f"--Free Shipping items only")
+        if self.single_shot:
+            log.info("\tSingle Shot purchase enabled")
+        if not self.take_screenshots:
+            log.info(f"--Screenshotting is Disabled")
+        if self.detailed:
+            log.info(f"--Detailed screenshots is enabled")
+        if self.random_delay:
+            log.info(f"--Page wait time in checkout will be randomized.")
+        if self.testing:
+            log.warning(f"--Testing Mode.  NO Purchases will be made.")
+
+        for idx, asins in enumerate(self.asin_list):
+            log.info(
+                f"--Looking for {len(asins)} ASINs between {self.reserve_min[idx]:.2f} and {self.reserve_max[idx]:.2f}"
+            )
+        log.info(f"{'=' * 50}")
 
 
 def get_timestamp_filename(name, extension):
